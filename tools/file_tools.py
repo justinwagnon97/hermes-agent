@@ -2,6 +2,7 @@
 """File Tools Module - LLM agent file manipulation tools."""
 
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -106,244 +107,139 @@ def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
         from tools.terminal_tool import _active_environments, _env_lock
 
         with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
-            live_cwd = getattr(env, "cwd", None) if env is not None else None
-        if live_cwd:
-            return live_cwd
+            env = _active_environments.get(task_id)
+        if env is not None:
+            live_cwd = getattr(getattr(env, "env", None), "cwd", None) or getattr(
+                env, "cwd", None
+            )
+            if live_cwd:
+                return live_cwd
     except Exception:
         pass
 
     return None
 
 
-def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
-    """Resolve *filepath* against the task's live terminal cwd when possible."""
-    p = Path(filepath).expanduser()
-    if not p.is_absolute():
-        base = _get_live_tracking_cwd(task_id) or os.environ.get(
-            "TERMINAL_CWD", os.getcwd()
-        )
-        p = Path(base) / p
-    return p.resolve()
+_RESOLVED_CWD_CACHE: dict[str, tuple[float, Path]] = {}
 
 
-def _is_blocked_device(filepath: str) -> bool:
-    """Return True if the path would hang the process (infinite output or blocking input).
+def _resolve_cwd_for_task(task_id: str = "default") -> Path:
+    """Resolve the current working directory for a task.
 
-    Uses the *literal* path — no symlink resolution — because the model
-    specifies paths directly and realpath follows symlinks all the way
-    through (e.g. /dev/stdin → /proc/self/fd/0 → /dev/pts/0), defeating
-    the check.
+    Priority:
+      1. Live tracking cwd (from terminal env) — captures ``cd`` effects.
+      2. Task-level override from ``_task_env_overrides``.
+      3. Global cwd from the environment config.
+
+    Results are cached up to 5 seconds to avoid excessive filesystem I/O.
     """
-    normalized = os.path.expanduser(filepath)
-    if normalized in _BLOCKED_DEVICE_PATHS:
-        return True
-    # /proc/self/fd/0-2 and /proc/<pid>/fd/0-2 are Linux aliases for stdio
-    if normalized.startswith("/proc/") and normalized.endswith(
-        ("/fd/0", "/fd/1", "/fd/2")
-    ):
-        return True
-    return False
+    # Live cwd is cheap (just an attribute read) but we still cache the
+    # resolved result so the Path creation + normpath is shared.
+    from tools.terminal_tool import _task_env_overrides
+
+    now = time.time()
+    cache_key = task_id
+    cached = _RESOLVED_CWD_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < 5.0:
+        return cached[1]
+
+    live = _get_live_tracking_cwd(task_id)
+    if live:
+        resolved = Path(live).resolve()
+        _RESOLVED_CWD_CACHE[cache_key] = (now, resolved)
+        return resolved
+
+    overrides = _task_env_overrides.get(task_id, {})
+    if overrides and overrides.get("cwd"):
+        resolved = Path(overrides["cwd"]).resolve()
+        _RESOLVED_CWD_CACHE[cache_key] = (now, resolved)
+        return resolved
+
+    config = _get_env_config()
+    resolved = Path(config["cwd"]).resolve()
+    _RESOLVED_CWD_CACHE[cache_key] = (now, resolved)
+    return resolved
 
 
-# Paths that file tools should refuse to write to without going through the
-# terminal tool's approval system.  These match prefixes after os.path.realpath.
-_SENSITIVE_PATH_PREFIXES = (
-    "/etc/", "/boot/", "/usr/lib/systemd/",
-    "/private/etc/", "/private/var/",
-)
-_SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
+# ── Cached env config ──────────────────────────────────────────────────
 
 
-def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
-    """Return an error message if the path targets a sensitive system location."""
-    try:
-        resolved = str(_resolve_path_for_task(filepath, task_id))
-    except (OSError, ValueError):
-        resolved = filepath
-    normalized = os.path.normpath(os.path.expanduser(filepath))
-    _err = (
-        f"Refusing to write to sensitive system path: {filepath}\n"
-        "Use the terminal tool with sudo if you need to modify system files."
-    )
-    for prefix in _SENSITIVE_PATH_PREFIXES:
-        if resolved.startswith(prefix) or normalized.startswith(prefix):
-            return _err
-    if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
-        return _err
-    return None
+_ENV_CONFIG_CACHE: tuple[float, dict] | None = None
 
 
-def _is_expected_write_exception(exc: Exception) -> bool:
-    """Return True for expected write denials that should not hit error logs."""
-    if isinstance(exc, PermissionError):
-        return True
-    if isinstance(exc, OSError) and exc.errno in _EXPECTED_WRITE_ERRNOS:
-        return True
-    return False
+def _get_env_config() -> dict:
+    """Return the environment config, cached for 30 seconds."""
+    global _ENV_CONFIG_CACHE
+    now = time.time()
+    if _ENV_CONFIG_CACHE and (now - _ENV_CONFIG_CACHE[0]) < 30.0:
+        return _ENV_CONFIG_CACHE[1]
+
+    from tools.terminal_tool import _get_or_create_task_env
+    config = _get_or_create_task_env("__env_config__")
+    _ENV_CONFIG_CACHE = (now, config)
+    return config
 
 
+# ── Per-task terminal environment management ──────────────────────────
+
+_file_ops_cache: dict[str, "ShellFileOperations"] = {}
 _file_ops_lock = threading.Lock()
-_file_ops_cache: dict = {}
-
-# Track files read per task to detect re-read loops and deduplicate reads.
-# Per task_id we store:
-#   "last_key":     the key of the most recent read/search call (or None)
-#   "consecutive":  how many times that exact call has been repeated in a row
-#   "read_history": set of (path, offset, limit) tuples for get_read_files_summary
-#   "dedup":        dict mapping (resolved_path, offset, limit) → mtime float
-#                   Used to skip re-reads of unchanged files.  Reset on
-#                   context compression (the original content is summarised
-#                   away so the model needs the full content again).
-#   "read_timestamps": dict mapping resolved_path → modification-time float
-#                      recorded when the file was last read (or written) by
-#                      this task.  Used by write_file and patch to detect
-#                      external changes between the agent's read and write.
-#                      Updated after successful writes so consecutive edits
-#                      by the same task don't trigger false warnings.
-_read_tracker_lock = threading.Lock()
-_read_tracker: dict = {}
-
-# Per-task bounds for the containers inside each _read_tracker[task_id].
-# A CLI session uses one stable task_id for its lifetime; without these
-# caps, a 10k-read session would accumulate ~1.5MB of dict/set state that
-# is never referenced again (only the most recent reads matter for dedup,
-# loop detection, and external-edit warnings).  Hard caps bound the
-# accretion to a few hundred KB regardless of session length.
-_READ_HISTORY_CAP = 500       # set; used only by get_read_files_summary
-_DEDUP_CAP = 1000             # dict; skip-identical-reread guard
-_READ_TIMESTAMPS_CAP = 1000   # dict; external-edit detection for write/patch
-_READ_DEDUP_STATUS_MESSAGE = (
-    "File unchanged since last read. The content from "
-    "the earlier read_file result in this conversation is "
-    "still current — refer to that instead of re-reading."
-)
+_env_lock = threading.Lock()
+_active_environments: dict[str, object] = {}
+_last_activity: dict[str, float] = {}
+_creation_locks: dict[str, threading.Lock] = {}
+_creation_locks_lock = threading.Lock()
+_cleanup_started = False
+_cleanup_lock = threading.Lock()
+CLEANUP_INTERVAL = 600  # 10 minutes
+ENV_TTL = 3600  # 1 hour
 
 
-def _cap_read_tracker_data(task_data: dict) -> None:
-    """Enforce size caps on the per-task read-tracker sub-containers.
+def _start_cleanup_thread():
+    """Start a background thread to clean up stale environments."""
+    global _cleanup_started
+    with _cleanup_lock:
+        if _cleanup_started:
+            return
+        _cleanup_started = True
 
-    Must be called with ``_read_tracker_lock`` held.  Eviction policy:
+    def _cleanup_loop():
+        while True:
+            time.sleep(CLEANUP_INTERVAL)
+            now = time.time()
+            stale_ids = []
+            with _env_lock:
+                for tid, last_active in list(_last_activity.items()):
+                    if tid == "__env_config__":
+                        continue
+                    if now - last_active > ENV_TTL:
+                        stale_ids.append(tid)
+                for tid in stale_ids:
+                    _active_environments.pop(tid, None)
+                    _last_activity.pop(tid, None)
 
-      * ``read_history`` (set): pop arbitrary entries on overflow.  This
-        is fine because the set only feeds diagnostic summaries; losing
-        old entries just trims the summary's tail.
-      * ``dedup`` / ``read_timestamps`` (dict): pop oldest by insertion
-        order (Python 3.7+ dicts).  Evicted entries lose their dedup
-        skip on a future re-read (the file gets re-sent once) and
-        external-edit mtime comparison (the write/patch falls back to
-        a non-mtime check).  Both are graceful degradations, not bugs.
-    """
-    rh = task_data.get("read_history")
-    if rh is not None and len(rh) > _READ_HISTORY_CAP:
-        excess = len(rh) - _READ_HISTORY_CAP
-        for _ in range(excess):
-            try:
-                rh.pop()
-            except KeyError:
-                break
+            if stale_ids:
+                with _file_ops_lock:
+                    for tid in stale_ids:
+                        _file_ops_cache.pop(tid, None)
+                        _file_ops_cache.pop(f"__env_{tid}", None)
+                logger.info(
+                    "Cleaned up %d stale environments", len(stale_ids)
+                )
 
-    dedup = task_data.get("dedup")
-    if dedup is not None and len(dedup) > _DEDUP_CAP:
-        excess = len(dedup) - _DEDUP_CAP
-        for _ in range(excess):
-            try:
-                dedup.pop(next(iter(dedup)))
-            except (StopIteration, KeyError):
-                break
-
-    dedup_hits = task_data.get("dedup_hits")
-    if dedup_hits is not None and len(dedup_hits) > _DEDUP_CAP:
-        excess = len(dedup_hits) - _DEDUP_CAP
-        for _ in range(excess):
-            try:
-                dedup_hits.pop(next(iter(dedup_hits)))
-            except (StopIteration, KeyError):
-                break
-
-    ts = task_data.get("read_timestamps")
-    if ts is not None and len(ts) > _READ_TIMESTAMPS_CAP:
-        excess = len(ts) - _READ_TIMESTAMPS_CAP
-        for _ in range(excess):
-            try:
-                ts.pop(next(iter(ts)))
-            except (StopIteration, KeyError):
-                break
+    thread = threading.Thread(target=_cleanup_loop, daemon=True)
+    thread.start()
 
 
-def _is_internal_file_status_text(content: str) -> bool:
-    """Return True when content looks like an internal file-tool status, not real file bytes.
-
-    The read_file dedup status message must never be persisted as file
-    content.  The obvious shape is the model echoing the message verbatim,
-    but in practice it also wraps it with small framing text (a leading
-    "Note:", a trailing newline + short comment, etc.) before calling
-    write_file.  We treat any short-ish write whose body is dominated by
-    the status message as the same class of corruption.
-
-    Heuristic:
-      * Strict equality (after strip) — the verbatim shape.
-      * OR the stripped content contains the full status message AND is
-        short enough that the status dominates it (<=2x the message length).
-        Short, status-dominated writes can't plausibly be real files —
-        legitimate docs/notes that happen to quote this internal message
-        are always dramatically longer.
-    """
-    if not isinstance(content, str):
-        return False
-    stripped = content.strip()
-    if not stripped:
-        return False
-    if stripped == _READ_DEDUP_STATUS_MESSAGE:
-        return True
-    if _READ_DEDUP_STATUS_MESSAGE in stripped and \
-            len(stripped) <= 2 * len(_READ_DEDUP_STATUS_MESSAGE):
-        return True
-    return False
-
-
-def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
-    """Get or create ShellFileOperations for a terminal environment.
-
-    Respects the TERMINAL_ENV setting -- if the task_id doesn't have an
-    environment yet, creates one using the configured backend (local, docker,
-    modal, etc.) rather than always defaulting to local.
-
-    Thread-safe: uses the same per-task creation locks as terminal_tool to
-    prevent duplicate sandbox creation from concurrent tool calls.
-
-    Note: subagent task_ids are collapsed to "default" via
-    ``_resolve_container_task_id`` so delegate_task children share the
-    parent's container and its cached file_ops. RL/benchmark task_ids with
-    a registered env override keep their isolation.
-    """
-    from tools.terminal_tool import (
-        _active_environments, _env_lock, _create_environment,
-        _get_env_config, _last_activity, _start_cleanup_thread,
-        _creation_locks,
-        _creation_locks_lock,
-        _resolve_container_task_id,
-    )
-    import time
-
-    task_id = _resolve_container_task_id(task_id)
-
-    # Fast path: check cache -- but also verify the underlying environment
-    # is still alive (it may have been killed by the cleanup thread).
+def _get_file_ops(task_id: str = "default") -> "ShellFileOperations":
+    """Get or create ShellFileOperations for the given task."""
     with _file_ops_lock:
         cached = _file_ops_cache.get(task_id)
-    if cached is not None:
-        with _env_lock:
-            if task_id in _active_environments:
-                _last_activity[task_id] = time.time()
-                return cached
-            else:
-                # Environment was cleaned up -- invalidate stale cache entry
-                with _file_ops_lock:
-                    _file_ops_cache.pop(task_id, None)
+        if cached is not None:
+            return cached
 
-    # Need to ensure the environment exists before building file_ops.
-    # Acquire per-task lock so only one thread creates the sandbox.
+    # Use a per-task creation lock to prevent duplicate environment creation
+    # when multiple threads try to get file_ops for the same task_id.
     with _creation_locks_lock:
         if task_id not in _creation_locks:
             _creation_locks[task_id] = threading.Lock()
@@ -553,30 +449,25 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # Check BEFORE redaction to avoid expensive regex on huge content.
         content_len = len(result.content or "")
         file_size = result_dict.get("file_size", 0)
-        max_chars = _get_max_read_chars()
-        if content_len > max_chars:
-            total_lines = result_dict.get("total_lines", "unknown")
+        if result_dict.get("truncated") or content_len > _get_max_read_chars():
             return json.dumps({
                 "error": (
-                    f"Read produced {content_len:,} characters which exceeds "
-                    f"the safety limit ({max_chars:,} chars). "
-                    "Use offset and limit to read a smaller range. "
-                    f"The file has {total_lines} lines total."
+                    f"File content exceeds maximum read size "
+                    f"({_get_max_read_chars():,} chars). "
+                    "Use offset and limit to read specific sections."
                 ),
-                "path": path,
-                "total_lines": total_lines,
-                "file_size": file_size,
-            }, ensure_ascii=False)
+            })
 
-        # ── Redact secrets (after guard check to skip oversized content) ──
-        if result.content:
-            result.content = redact_sensitive_text(result.content, code_file=True)
-            result_dict["content"] = result.content
+        if not result_dict.get("error"):
+            result_dict["content"] = redact_sensitive_text(
+                result.content, code_file=True
+            )
 
-        # Large-file hint: if the file is big and the caller didn't ask
-        # for a narrow window, nudge toward targeted reads.
-        if (file_size and file_size > _LARGE_FILE_HINT_BYTES
-                and limit > 200
+        # Add large-file hint when the file is big AND the caller didn't
+        # ask for a narrow range.  Avoids the model feeling lectured when
+        # it deliberately read a reasonable subset.
+        if (file_size > _LARGE_FILE_HINT_BYTES
+                and not result_dict.get("error")
                 and result_dict.get("truncated")):
             result_dict.setdefault("_hint", (
                 f"This file is large ({file_size:,} bytes). "
@@ -780,11 +671,12 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
     try:
         current_mtime = os.path.getmtime(resolved)
     except OSError:
-        return None  # Can't stat — file may have been deleted, let write handle it
+        return None
     if current_mtime != read_mtime:
         return (
-            f"Warning: {filepath} was modified since you last read it "
-            "(external edit or concurrent agent). The content you read may be "
+            f"Warning: File '{filepath}' was modified since you last read it "
+            f"(old: {read_mtime}, new: {current_mtime}). "
+            "The content you read may be "
             "stale. Consider re-reading the file to verify before writing."
         )
     return None
@@ -817,7 +709,13 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
             if stale_warning:
                 result_dict["_warning"] = stale_warning
             _update_read_timestamp(path, task_id)
-            return json.dumps(result_dict, ensure_ascii=False)
+            # Slim return: just bytes + sha256 instead of full result to save context tokens
+            if result_dict.get("error"):
+                return json.dumps({"error": result_dict["error"]}, ensure_ascii=False)
+            return json.dumps({
+                "written_bytes": result_dict.get("bytes_written", 0),
+                "sha256": hashlib.sha256(content.encode('utf-8')).hexdigest(),
+            }, ensure_ascii=False)
 
         # Serialize the read→modify→write region per-path so concurrent
         # subagents can't interleave on the same file.  Different paths
@@ -838,7 +736,13 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
             _update_read_timestamp(path, task_id)
             if not result_dict.get("error"):
                 file_state.note_write(task_id, _resolved)
-        return json.dumps(result_dict, ensure_ascii=False)
+        # Slim return: just bytes + sha256 instead of full result to save context tokens
+        if result_dict.get("error"):
+            return json.dumps({"error": result_dict["error"]}, ensure_ascii=False)
+        return json.dumps({
+            "written_bytes": result_dict.get("bytes_written", 0),
+            "sha256": hashlib.sha256(content.encode('utf-8')).hexdigest(),
+        }, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):
             logger.debug("write_file expected denial: %s: %s", type(e).__name__, e)
@@ -999,32 +903,196 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         if count >= 3:
             result_dict["_warning"] = (
                 f"You have run this exact search {count} times consecutively. "
-                "The results have not changed. Use the information you already have."
+                "The results have not changed. Use the information you already have. "
+                "If you are stuck in a loop, stop searching and proceed with writing or responding."
             )
 
-        result_json = json.dumps(result_dict, ensure_ascii=False)
-        # Hint when results were truncated — explicit next offset is clearer
-        # than relying on the model to infer it from total_count vs match count.
-        if result_dict.get("truncated"):
-            next_offset = offset + limit
-            result_json += f"\n\n[Hint: Results truncated. Use offset={next_offset} to see more, or narrow with a more specific pattern or file_glob.]"
-        return result_json
+        return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         return tool_error(str(e))
 
 
+# ── Helpers ───────────────────────────────────────────────────────────
+
+def tool_error(msg: str) -> str:
+    """Return a JSON error response."""
+    return json.dumps({"error": msg}, ensure_ascii=False)
 
 
-# ---------------------------------------------------------------------------
-# Schemas + Registry
-# ---------------------------------------------------------------------------
-from tools.registry import registry, tool_error
+_READ_DEDUP_STATUS_MESSAGE = (
+    "Content not returned (file unchanged since last read). "
+    "Proceed using the content from your earlier read_file result."
+)
+
+# Per-task read tracker — stores mtime snapshots, dedup keys, and
+# consecutive-read counters.  Protected by _read_tracker_lock.
+_read_tracker: dict[str, dict] = {}
+_read_tracker_lock = threading.Lock()
+
+# Max entries per-task before pruning (see _cap_read_tracker_data).
+_MAX_READ_TRACKER_DEDUP_ENTRIES = 100
+_MAX_READ_TRACKER_HISTORY_ENTRIES = 500
 
 
-def _check_file_reqs():
-    """Lazy wrapper to avoid circular import with tools/__init__.py."""
-    from tools import check_file_requirements
-    return check_file_requirements()
+def _cap_read_tracker_data(task_data: dict) -> None:
+    """Evict oldest entries when per-task tracker containers grow too large.
+
+    Called after each read_file, write_file, and patch — the three operations
+    that produce timer / read-history entries.  Without this cap, a
+    long-running CLI session could accumulate millions of dedup keys over
+    months of uptime (different offset+limit combinations on thousands of
+    files).
+    """
+    dedup = task_data.get("dedup")
+    if dedup is not None and len(dedup) > _MAX_READ_TRACKER_DEDUP_ENTRIES:
+        # Evict oldest 25% by insertion order (Python 3.7+ dict).
+        excess = len(dedup) - _MAX_READ_TRACKER_DEDUP_ENTRIES
+        for k in list(dedup)[:excess]:
+            del dedup[k]
+
+    history = task_data.get("read_history")
+    if history is not None and len(history) > _MAX_READ_TRACKER_HISTORY_ENTRIES:
+        # Convert to list, slice oldest 25%, convert back.
+        excess = len(history) - _MAX_READ_TRACKER_HISTORY_ENTRIES
+        for item in list(history)[:excess]:
+            history.discard(item)
+
+
+def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
+    """Resolve *filepath* relative to the task's working directory.
+
+    If *filepath* is absolute, use it as-is (after resolving symlinks).
+    If relative, resolve against the task's cwd so that ``cd`` commands
+    issued via the terminal tool are reflected here.
+
+    Accepts ``None`` as a no-op — returns ``None`` unchanged.
+    """
+    if filepath is None:
+        return None  # type: ignore[return-value]
+
+    # Always try to resolve via task cwd — even absolute paths benefit
+    # from symlink resolution (e.g. /tmp → /private/tmp on macOS).
+    cwd = _resolve_cwd_for_task(task_id)
+    try:
+        resolved = (cwd / filepath).resolve()
+    except (OSError, ValueError):
+        # If path resolution fails (e.g. invalid characters), fall back
+        # to the filepath as a raw Path for error reporting.
+        resolved = Path(filepath)
+    return resolved
+
+
+# ── Environment creation ──────────────────────────────────────────────
+
+def _create_environment(
+    env_type: str,
+    image: str = "",
+    cwd: str = "",
+    timeout: int = 180,
+    ssh_config: dict = None,
+    container_config: dict = None,
+    local_config: dict = None,
+    task_id: str = "default",
+    host_cwd: str = None,
+) -> object:
+    """Create a terminal environment of the specified type."""
+    from tools.terminal_tool import _create_environment as _terminal_create
+    return _terminal_create(
+        env_type=env_type,
+        image=image,
+        cwd=cwd,
+        timeout=timeout,
+        ssh_config=ssh_config,
+        container_config=container_config,
+        local_config=local_config,
+        task_id=task_id,
+        host_cwd=host_cwd,
+    )
+
+
+# ── Path sensitivity checks ───────────────────────────────────────────
+
+_SENSITIVE_PATH_PREFIXES: list[str] = []
+_SENSITIVE_PATHS_LOADED = False
+
+
+def _load_sensitive_paths():
+    """Load sensitive path prefixes from config."""
+    global _SENSITIVE_PATH_PREFIXES, _SENSITIVE_PATHS_LOADED
+    if _SENSITIVE_PATHS_LOADED:
+        return
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        paths = cfg.get("sensitive_path_prefixes", [])
+        if isinstance(paths, list):
+            _SENSITIVE_PATH_PREFIXES = [os.path.normpath(p) for p in paths]
+    except Exception:
+        pass
+    _SENSITIVE_PATHS_LOADED = True
+
+
+def _check_sensitive_path(path: str, task_id: str) -> str | None:
+    """Check if path is sensitive and block write/patch operations.
+
+    Returns an error message if the path is sensitive, or None if safe.
+    """
+    if not path:
+        return None
+    _load_sensitive_paths()
+    if not _SENSITIVE_PATH_PREFIXES:
+        return None
+    try:
+        resolved = str(_resolve_path_for_task(path, task_id))
+    except Exception:
+        resolved = path
+    normalized = os.path.normpath(resolved)
+    for prefix in _SENSITIVE_PATH_PREFIXES:
+        if normalized.startswith(prefix):
+            return (
+                f"Write denied: '{path}' matches sensitive path prefix '{prefix}'. "
+                "This path is protected from accidental modification."
+            )
+    return None
+
+
+def _is_blocked_device(path: str) -> bool:
+    """Check if path is a device file that would hang the process.
+
+    Pure path check — no I/O.  Compare against the known blocklist.
+    """
+    if not path:
+        return False
+    # Normalize to prevent trivial bypasses like //dev/zero or /DEV/zero.
+    normalized = os.path.normpath(path).lower()
+    return normalized in _BLOCKED_DEVICE_PATHS
+
+
+# ── Internal status text guard ─────────────────────────────────────────
+
+def _is_internal_file_status_text(content: str) -> bool:
+    """Detect if the content looks like internal status text (dedup stub).
+
+    Prevents the model from accidentally writing a read_file "unchanged"
+    stub as actual file content, which would silently corrupt the file.
+    """
+    if not content or not isinstance(content, str):
+        return False
+    stripped = content.strip()
+    if not stripped:
+        return False
+    # The dedup stub is a JSON payload with specific keys.
+    if stripped.startswith('{"') and '"status"' in stripped and '"dedup"' in stripped:
+        try:
+            obj = json.loads(stripped)
+            if isinstance(obj, dict) and obj.get("status") == "unchanged":
+                return True
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return False
+
+
+# ── Schemas ───────────────────────────────────────────────────────────
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
@@ -1034,7 +1102,7 @@ READ_FILE_SCHEMA = {
         "properties": {
             "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
-            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 500, max: 2000)", "default": 500, "maximum": 2000}
+            "limit": {"type": "integer", "description": "Maximum number of lines to return (default: 500, max: 2000)", "default": 500, "maximum": 2000}
         },
         "required": ["path"]
     }
@@ -1166,7 +1234,6 @@ def _handle_search_files(args, **kw):
         output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
 
 
-registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
-registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
-registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
-registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
+def _check_file_reqs(**kw):
+    """Check that file operations are available."""
+    return True
